@@ -1,0 +1,19 @@
+name: ftp_movies
+description: Browse and play movies from multiple FTP servers.
+publish_to: none
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ftpconnect: ^2.0.7
+  media_kit: ^1.1.10
+  media_kit_video: ^1.2.4
+  media_kit_libs_video: ^1.0.4
+  shared_preferences: ^2.2.2
+
+flutter:
+  uses-material-design: true
