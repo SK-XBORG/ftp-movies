@@ -571,4 +571,372 @@ class _HomePageState extends State<HomePage> {
                     icon: Icon(later ? Icons.bookmark : Icons.bookmark_border, color: later ? Colors.amber : Colors.white70),
                     onPressed: () => Store.i.toggleLater(m),
                   )),
-              Positioned
+                            Positioned(
+                  right: 4,
+                  bottom: 6,
+                  child: IconButton.filledTonal(
+                      iconSize: 18,
+                      tooltip: 'Download',
+                      icon: const Icon(Icons.download_rounded),
+                      onPressed: () => _download(m))),
+              if (h != null && h.progress > 0.01)
+                Positioned(left: 0, right: 0, bottom: 0, child: LinearProgressIndicator(value: h.progress, minHeight: 3)),
+            ]),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(10),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(m.clean, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w600)),
+              const SizedBox(height: 2),
+              Text(m.server, style: Theme.of(context).textTheme.bodySmall),
+            ]),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _later() => Store.i.later.isEmpty
+      ? const Center(child: Text('Watch later khali. Movie card e 🔖 chap.'))
+      : GridView.builder(
+          padding: const EdgeInsets.all(12),
+          gridDelegate: _grid,
+          itemCount: Store.i.later.length,
+          itemBuilder: (_, i) => _card(Store.i.later[i]));
+
+  Widget _history() => Store.i.hist.isEmpty
+      ? const Center(child: Text('Kono watch history nai'))
+      : ListView(children: [
+          for (final h in Store.i.hist)
+            ListTile(
+              leading: const CircleAvatar(child: Icon(Icons.play_arrow)),
+              title: Text(h.m.clean, maxLines: 1, overflow: TextOverflow.ellipsis),
+              subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('${_ago(h.t)} • ${(h.progress * 100).round()}% dekha hoyeche'),
+                const SizedBox(height: 4),
+                LinearProgressIndicator(value: h.progress),
+              ]),
+              onTap: () => _play(h.m),
+              trailing: IconButton(icon: const Icon(Icons.close), onPressed: () => Store.i.removeHist(h)),
+            ),
+        ]);
+
+  Widget _downloads() => ListenableBuilder(
+        listenable: Downloads.i,
+        builder: (_, __) {
+          final items = Downloads.i.items;
+          if (items.isEmpty) return const Center(child: Text('Kono download nai'));
+          return ListView(children: [
+            for (final d in items)
+              ListTile(
+                leading: Icon(d.failed ? Icons.error_outline : d.done ? Icons.play_circle : Icons.downloading),
+                title: Text(d.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                subtitle: d.done
+                    ? const Text('Downloaded (offline dekha jabe)')
+                    : d.failed
+                        ? const Text('Fail hoyeche')
+                        : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            const SizedBox(height: 6),
+                            LinearProgressIndicator(value: d.total > 0 ? d.received / d.total : null),
+                            Text('${(d.received / 1048576).toStringAsFixed(0)} MB'
+                                '${d.total > 0 ? ' / ${(d.total / 1048576).toStringAsFixed(0)} MB' : ''}'),
+                          ]),
+                onTap: d.done ? () => _play(Movie(d.title, d.path, 'Downloaded')) : null,
+                trailing: IconButton(
+                    icon: Icon(d.done ? Icons.delete_outline : Icons.close), onPressed: () => Downloads.i.remove(d)),
+              ),
+          ]);
+        },
+      );
+
+  Widget _serverList() => servers.isEmpty
+      ? const Center(child: Text('Kono server nai. + chap.'))
+      : ListView(children: [
+          for (final s in servers)
+            ListTile(
+              leading: const Icon(Icons.dns),
+              title: Text(s.name),
+              subtitle: Text(s.url),
+              onTap: () => _editServer(s),
+              trailing: IconButton(
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: () async {
+                    setState(() {
+                      servers.remove(s);
+                      movies.removeWhere((m) => m.server == s.name);
+                      _refilter();
+                    });
+                    await _saveServers();
+                  }),
+            ),
+        ]);
+}
+
+class PlayerPage extends StatefulWidget {
+  final Movie movie;
+  final List<Movie> all;
+  const PlayerPage({super.key, required this.movie, required this.all});
+  @override
+  State<PlayerPage> createState() => _PlayerPageState();
+}
+
+class _PlayerPageState extends State<PlayerPage> {
+  late final Player player = Player(configuration: const PlayerConfiguration(bufferSize: 64 * 1024 * 1024));
+  late final VideoController controller = VideoController(player);
+  double volume = 100, bright = 0.5;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+    final np = player.platform;
+    if (np is NativePlayer) {
+      np.setProperty('cache', 'yes');
+      np.setProperty('demuxer-readahead-secs', '90');
+    }
+    ScreenBrightness().current.then((v) => bright = v).catchError((_) => 0.5);
+    _start();
+  }
+
+  final hint = ValueNotifier<String?>(null);
+  Timer? _hintT;
+
+  void _skip(int sec) {
+    var p = player.state.position + Duration(seconds: sec);
+    final d = player.state.duration;
+    if (p < Duration.zero) p = Duration.zero;
+    if (d > Duration.zero && p > d) p = d;
+    player.seek(p);
+    hint.value = sec < 0 ? '-${-sec}s' : '+${sec}s';
+    _hintT?.cancel();
+    _hintT = Timer(const Duration(milliseconds: 600), () => hint.value = null);
+  }
+
+  Future<void> _start() async {
+    final h = Store.i.find(widget.movie.url);
+    await player.open(Media(widget.movie.url));
+    if (h != null && h.resumable) {
+      await player.stream.duration.firstWhere((d) => d > Duration.zero);
+      await player.seek(Duration(milliseconds: h.pos));
+    }
+    _save();
+    _timer = Timer.periodic(const Duration(seconds: 10), (_) => _save());
+  }
+
+  void _save() {
+    final d = player.state.duration.inMilliseconds;
+    if (d > 0) Store.i.record(widget.movie, player.state.position.inMilliseconds, d);
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _hintT?.cancel();
+    _save();
+    Store.i.flush();
+    try {
+      ScreenBrightness().resetScreenBrightness();
+    } catch (_) {}
+    player.dispose();
+    super.dispose();
+  }
+
+  String _lbl(dynamic t, int i) {
+    final p = <String>[];
+    if (t.title != null) p.add(t.title);
+    if (t.language != null) p.add(t.language);
+    return p.isEmpty ? 'Track ${i + 1}' : p.join(' • ');
+  }
+
+  Future<void> _switch(Movie m) async {
+    final pos = player.state.position;
+    Navigator.pop(context);
+    await player.open(Media(m.url));
+    await Future.delayed(const Duration(seconds: 1));
+    player.seek(pos);
+  }
+
+  void _settings() {
+    final versions = widget.movie.key.isEmpty
+        ? <Movie>[]
+        : widget.all.where((m) => m.key == widget.movie.key && m.url != widget.movie.url).toList();
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (_) => StatefulBuilder(builder: (ctx, set) {
+        final tr = player.state.tracks;
+        final audio = tr.audio.where((t) => t.id != 'auto' && t.id != 'no').toList();
+        final subs = tr.subtitle.where((t) => t.id != 'auto' && t.id != 'no').toList();
+        Widget head(String t) => Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+            child: Text(t, style: const TextStyle(fontWeight: FontWeight.bold)));
+        Widget slider(IconData ic, double v, double min, double max, void Function(double) f) => Row(children: [
+              Padding(padding: const EdgeInsets.only(left: 16), child: Icon(ic)),
+              Expanded(child: Slider(value: v.clamp(min, max), min: min, max: max, onChanged: (x) => set(() => f(x)))),
+            ]);
+        return ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(ctx).size.height * 0.75),
+          child: SingleChildScrollView(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              head('Brightness'),
+              slider(Icons.brightness_6, bright, 0.02, 1, (v) {
+                bright = v;
+                ScreenBrightness().setScreenBrightness(v);
+              }),
+              head('Sound'),
+              slider(Icons.volume_up, volume, 0, 100, (v) {
+                volume = v;
+                player.setVolume(v);
+              }),
+              if (audio.length > 1) ...[
+                head('Language / Audio'),
+                for (var i = 0; i < audio.length; i++)
+                  ListTile(
+                    dense: true,
+                    title: Text(_lbl(audio[i], i)),
+                    trailing: player.state.track.audio.id == audio[i].id ? const Icon(Icons.check) : null,
+                    onTap: () {
+                      player.setAudioTrack(audio[i]);
+                      set(() {});
+                    },
+                  ),
+              ],
+              head('Subtitle'),
+              ListTile(
+                dense: true,
+                title: const Text('Off'),
+                trailing: player.state.track.subtitle.id == 'no' ? const Icon(Icons.check) : null,
+                onTap: () {
+                  player.setSubtitleTrack(SubtitleTrack.no());
+                  set(() {});
+                },
+              ),
+              for (var i = 0; i < subs.length; i++)
+                ListTile(
+                  dense: true,
+                  title: Text(_lbl(subs[i], i)),
+                  trailing: player.state.track.subtitle.id == subs[i].id ? const Icon(Icons.check) : null,
+                  onTap: () {
+                    player.setSubtitleTrack(subs[i]);
+                    set(() {});
+                  },
+                ),
+              head('Speed'),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Wrap(spacing: 8, children: [
+                  for (final s in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
+                    ChoiceChip(
+                        label: Text('${s}x'),
+                        selected: player.state.rate == s,
+                        onSelected: (_) {
+                          player.setRate(s);
+                          set(() {});
+                        }),
+                ]),
+              ),
+              if (versions.isNotEmpty) ...[
+                head('Quality / Resolution'),
+                for (final m in versions)
+                  ListTile(
+                    dense: true,
+                    leading: const Icon(Icons.high_quality),
+                    title: Text(m.res.isEmpty ? m.name : '${m.res}  •  ${m.server}'),
+                    subtitle: Text(m.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    onTap: () => _switch(m),
+                  ),
+              ],
+              const SizedBox(height: 24),
+            ]),
+          ),
+        );
+      }),
+    );
+  }
+
+  // Double-tap left/right side = -5s / +5s (top & bottom bars stay untouched).
+  Widget _zones() => Positioned.fill(
+        child: Padding(
+          padding: const EdgeInsets.only(top: 90, bottom: 130),
+          child: Row(children: [
+            Expanded(
+                flex: 3,
+                child: GestureDetector(behavior: HitTestBehavior.translucent, onDoubleTap: () => _skip(-5))),
+            const Spacer(flex: 4),
+            Expanded(
+                flex: 3,
+                child: GestureDetector(behavior: HitTestBehavior.translucent, onDoubleTap: () => _skip(5))),
+          ]),
+        ),
+      );
+
+  Widget _hintView() => Positioned.fill(
+        child: IgnorePointer(
+          child: ValueListenableBuilder<String?>(
+            valueListenable: hint,
+            builder: (_, v, __) => v == null
+                ? const SizedBox()
+                : Align(
+                    alignment: Alignment(v.startsWith('-') ? -0.6 : 0.6, 0),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                      decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(30)),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(v.startsWith('-') ? Icons.fast_rewind : Icons.fast_forward, color: Colors.white),
+                        const SizedBox(width: 6),
+                        const Text('5 sec', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                      ]),
+                    ),
+                  ),
+          ),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final top = MediaQuery.of(context).padding.top;
+    final title = Expanded(
+        child: Text(widget.movie.clean,
+            maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white)));
+    final tune = MaterialCustomButton(icon: const Icon(Icons.tune), onPressed: _settings);
+    final back = MaterialCustomButton(icon: const Icon(Icons.arrow_back), onPressed: () => Navigator.pop(context));
+    final rew = MaterialCustomButton(icon: const Icon(Icons.replay_5), iconSize: 40, onPressed: () => _skip(-5));
+    final fwd = MaterialCustomButton(icon: const Icon(Icons.forward_5), iconSize: 40, onPressed: () => _skip(5));
+    MaterialVideoControlsThemeData theme(List<Widget> topBar) => MaterialVideoControlsThemeData(
+          topButtonBar: topBar,
+          topButtonBarMargin: EdgeInsets.fromLTRB(12, top + 12, 12, 0),
+          primaryButtonBar: [
+            const Spacer(flex: 2),
+            rew,
+            const Spacer(),
+            MaterialPlayOrPauseButton(iconSize: 56),
+            const Spacer(),
+            fwd,
+            const Spacer(flex: 2),
+          ],
+          bottomButtonBar: [MaterialPositionIndicator(), const Spacer(), MaterialFullscreenButton()],
+          bottomButtonBarMargin: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+          seekBarMargin: const EdgeInsets.fromLTRB(20, 0, 20, 34),
+          seekBarContainerHeight: 48,
+          seekBarThumbSize: 18,
+          brightnessGesture: true,
+          volumeGesture: true,
+          seekGesture: true,
+        );
+    // Swipe up/down: left side = brightness, right side = volume. Swipe sideways = seek.
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: MaterialVideoControlsTheme(
+        normal: theme([back, title, tune]),
+        fullscreen: theme([title, tune]),
+        child: Video(
+          controller: controller,
+          controls: (s) => Stack(children: [MaterialVideoControls(s), _zones(), _hintView()]),
+        ),
+      ),
+    );
+  }
+}
+
