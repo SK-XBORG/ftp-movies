@@ -30,17 +30,21 @@ class Movie {
   factory Movie.fromJson(Map<String, dynamic> j) => Movie(j['t'], j['u'], j['s']);
   String get _plain =>
       name.replaceAll(RegExp(r'\.[^.]+$'), '').replaceAll(RegExp(r'[._]'), ' ').trim();
-  String get clean {
+  late final String clean = _clean();
+  late final String lc = clean.toLowerCase();
+  String _clean() {
     final m = _yearRe.firstMatch(_plain);
     return m == null ? _plain : '${m[1]!.trim()} (${m[2]})';
   }
 
-  String get key {
+  late final String key = _key();
+  String _key() {
     final m = _yearRe.firstMatch(_plain);
     return m == null ? '' : '${m[1]!.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '')}${m[2]}';
   }
 
-  String get res {
+  late final String res = _res();
+  String _res() {
     final m = _resRe.firstMatch(Uri.decodeFull(url));
     if (m == null) return '';
     final r = m[1]!.toLowerCase();
@@ -71,29 +75,35 @@ class Store extends ChangeNotifier {
     hist = (jsonDecode(p.getString('hist') ?? '[]') as List)
         .map((e) => Hist(Movie.fromJson(e['m']), e['p'], e['d'], e['t']))
         .toList();
+    _idx();
     notifyListeners();
   }
 
-  void _save() {
+  void _save({bool notify = true}) {
+    _idx();
     prefs.setString('later', jsonEncode(later.map((e) => e.toJson()).toList()));
     prefs.setString('hist', jsonEncode(hist.map((e) => e.toJson()).toList()));
-    notifyListeners();
+    if (notify) notifyListeners();
   }
 
-  bool isLater(Movie m) => later.any((x) => x.url == m.url);
+  void flush() => notifyListeners();
+
+  Set<String> _lu = {};
+  Map<String, Hist> _hi = {};
+  void _idx() {
+    _lu = later.map((e) => e.url).toSet();
+    _hi = {for (final h in hist) h.m.url: h};
+  }
+
+  bool isLater(Movie m) => _lu.contains(m.url);
   void toggleLater(Movie m) {
     isLater(m) ? later.removeWhere((x) => x.url == m.url) : later.insert(0, m);
     _save();
   }
 
-  Hist? find(String url) {
-    for (final h in hist) {
-      if (h.m.url == url) return h;
-    }
-    return null;
-  }
+  Hist? find(String url) => _hi[url];
 
-  void record(Movie m, int pos, int dur) {
+  void record(Movie m, int pos, int dur, {bool notify = false}) {
     var h = find(m.url);
     if (h == null) {
       h = Hist(m, pos, dur, 0);
@@ -105,7 +115,7 @@ class Store extends ChangeNotifier {
     h.t = DateTime.now().millisecondsSinceEpoch;
     hist.remove(h);
     hist.insert(0, h);
-    _save();
+    _save(notify: notify);
   }
 
   void removeHist(Hist h) {
@@ -225,6 +235,9 @@ class _HomePageState extends State<HomePage> {
   String query = '', resFilter = '', status = '';
   int tab = 0;
   bool scanning = false;
+  List<Movie> view = [];
+  Set<String> present = {};
+  DateTime _last = DateTime(2000);
   late SharedPreferences prefs;
 
   @override
@@ -249,6 +262,24 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       servers = (jsonDecode(prefs.getString('srv2') ?? '[]') as List).map((e) => Server.fromJson(e)).toList();
       movies = (jsonDecode(prefs.getString('mov3') ?? '[]') as List).map((e) => Movie.fromJson(e)).toList();
+      _refilter();
+    });
+  }
+
+  void _refilter() {
+    final q = query.toLowerCase();
+    view = movies.where((m) => (q.isEmpty || m.lc.contains(q)) && (resFilter.isEmpty || m.res == resFilter)).toList()
+      ..sort((a, b) => a.lc.compareTo(b.lc));
+    present = movies.map((m) => m.res).toSet();
+  }
+
+  void _tick() {
+    final n = DateTime.now();
+    if (!mounted || n.difference(_last).inMilliseconds < 1500) return;
+    _last = n;
+    setState(() {
+      status = '${movies.length} ta movie pawa gese';
+      _refilter();
     });
   }
 
@@ -273,6 +304,7 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       scanning = false;
       status = '';
+      _refilter();
     });
   }
 
@@ -291,6 +323,7 @@ class _HomePageState extends State<HomePage> {
     }
     final links =
         RegExp('href="([^"]+)"', caseSensitive: false).allMatches(body).map((m) => m.group(1)!).toSet();
+    final subs = <Uri>[];
     for (final raw in links) {
       if (raw.startsWith('?') || raw.startsWith('#') || raw.startsWith('..')) continue;
       Uri u;
@@ -302,16 +335,19 @@ class _HomePageState extends State<HomePage> {
       // Ads / external links dropped: only same host + inside this folder.
       if (u.host != dir.host || !u.path.startsWith(dir.path) || u.path == dir.path) continue;
       if (u.path.endsWith('/')) {
-        await _crawl(c, s, u, depth + 1);
+        subs.add(u);
       } else {
         final name = u.pathSegments.isEmpty ? '' : u.pathSegments.last;
         if (videoExt.contains(name.split('.').last.toLowerCase()) &&
             !_junkRe.hasMatch(name) &&
             _seen.add(u.toString())) {
           movies.add(Movie(name, u.toString(), s.name));
-          if (mounted) setState(() => status = '${movies.length} ta movie pawa gese');
+          _tick();
         }
       }
+    }
+    for (var i = 0; i < subs.length; i += 6) {
+      await Future.wait(subs.skip(i).take(6).map((u) => _crawl(c, s, u, depth + 1)));
     }
   }
 
@@ -435,13 +471,8 @@ class _HomePageState extends State<HomePage> {
 
   Widget _library() {
     const order = ['4K', '1080p', '720p', '480p', '360p'];
-    final present = movies.map((m) => m.res).toSet();
     final cont = Store.i.hist.where((h) => h.resumable).take(10).toList();
-    final list = movies
-        .where((m) =>
-            m.clean.toLowerCase().contains(query.toLowerCase()) && (resFilter.isEmpty || m.res == resFilter))
-        .toList()
-      ..sort((a, b) => a.clean.toLowerCase().compareTo(b.clean.toLowerCase()));
+    final list = view;
     return CustomScrollView(slivers: [
       SliverToBoxAdapter(
         child: Padding(
@@ -449,7 +480,10 @@ class _HomePageState extends State<HomePage> {
           child: SearchBar(
             hintText: 'Movie search (${movies.length})',
             leading: const Icon(Icons.search),
-            onChanged: (v) => setState(() => query = v),
+            onChanged: (v) => setState(() {
+              query = v;
+              _refilter();
+            }),
           ),
         ),
       ),
@@ -463,7 +497,10 @@ class _HomePageState extends State<HomePage> {
                 child: ChoiceChip(
                     label: Text(r.isEmpty ? 'All' : r),
                     selected: resFilter == r,
-                    onSelected: (_) => setState(() => resFilter = r)),
+                    onSelected: (_) => setState(() {
+                      resFilter = r;
+                      _refilter();
+                    })),
               ),
           ]),
         ),
@@ -491,7 +528,7 @@ class _HomePageState extends State<HomePage> {
       else
         SliverPadding(
           padding: const EdgeInsets.all(12),
-          sliver: SliverGrid.builder(gridDelegate: _grid, itemCount: list.length, itemBuilder: (_, i) => _card(list[i])),
+          sliver: SliverGrid.builder(gridDelegate: _grid, itemCount: list.length, itemBuilder: (_, i) => RepaintBoundary(child: _card(list[i]))),
         ),
     ]);
   }
@@ -534,286 +571,4 @@ class _HomePageState extends State<HomePage> {
                     icon: Icon(later ? Icons.bookmark : Icons.bookmark_border, color: later ? Colors.amber : Colors.white70),
                     onPressed: () => Store.i.toggleLater(m),
                   )),
-              Positioned(
-                  right: 4,
-                  bottom: 6,
-                  child: IconButton.filledTonal(
-                      iconSize: 18,
-                      tooltip: 'Download',
-                      icon: const Icon(Icons.download_rounded),
-                      onPressed: () => _download(m))),
-              if (h != null && h.progress > 0.01)
-                Positioned(left: 0, right: 0, bottom: 0, child: LinearProgressIndicator(value: h.progress, minHeight: 3)),
-            ]),
-          ),
-          Padding(
-            padding: const EdgeInsets.all(10),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(m.clean, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w600)),
-              const SizedBox(height: 2),
-              Text(m.server, style: Theme.of(context).textTheme.bodySmall),
-            ]),
-          ),
-        ]),
-      ),
-    );
-  }
-
-  Widget _later() => Store.i.later.isEmpty
-      ? const Center(child: Text('Watch later khali. Movie card e 🔖 chap.'))
-      : GridView.builder(
-          padding: const EdgeInsets.all(12),
-          gridDelegate: _grid,
-          itemCount: Store.i.later.length,
-          itemBuilder: (_, i) => _card(Store.i.later[i]));
-
-  Widget _history() => Store.i.hist.isEmpty
-      ? const Center(child: Text('Kono watch history nai'))
-      : ListView(children: [
-          for (final h in Store.i.hist)
-            ListTile(
-              leading: const CircleAvatar(child: Icon(Icons.play_arrow)),
-              title: Text(h.m.clean, maxLines: 1, overflow: TextOverflow.ellipsis),
-              subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('${_ago(h.t)} • ${(h.progress * 100).round()}% dekha hoyeche'),
-                const SizedBox(height: 4),
-                LinearProgressIndicator(value: h.progress),
-              ]),
-              onTap: () => _play(h.m),
-              trailing: IconButton(icon: const Icon(Icons.close), onPressed: () => Store.i.removeHist(h)),
-            ),
-        ]);
-
-  Widget _downloads() => ListenableBuilder(
-        listenable: Downloads.i,
-        builder: (_, __) {
-          final items = Downloads.i.items;
-          if (items.isEmpty) return const Center(child: Text('Kono download nai'));
-          return ListView(children: [
-            for (final d in items)
-              ListTile(
-                leading: Icon(d.failed ? Icons.error_outline : d.done ? Icons.play_circle : Icons.downloading),
-                title: Text(d.title, maxLines: 1, overflow: TextOverflow.ellipsis),
-                subtitle: d.done
-                    ? const Text('Downloaded (offline dekha jabe)')
-                    : d.failed
-                        ? const Text('Fail hoyeche')
-                        : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                            const SizedBox(height: 6),
-                            LinearProgressIndicator(value: d.total > 0 ? d.received / d.total : null),
-                            Text('${(d.received / 1048576).toStringAsFixed(0)} MB'
-                                '${d.total > 0 ? ' / ${(d.total / 1048576).toStringAsFixed(0)} MB' : ''}'),
-                          ]),
-                onTap: d.done ? () => _play(Movie(d.title, d.path, 'Downloaded')) : null,
-                trailing: IconButton(
-                    icon: Icon(d.done ? Icons.delete_outline : Icons.close), onPressed: () => Downloads.i.remove(d)),
-              ),
-          ]);
-        },
-      );
-
-  Widget _serverList() => servers.isEmpty
-      ? const Center(child: Text('Kono server nai. + chap.'))
-      : ListView(children: [
-          for (final s in servers)
-            ListTile(
-              leading: const Icon(Icons.dns),
-              title: Text(s.name),
-              subtitle: Text(s.url),
-              onTap: () => _editServer(s),
-              trailing: IconButton(
-                  icon: const Icon(Icons.delete_outline),
-                  onPressed: () async {
-                    setState(() {
-                      servers.remove(s);
-                      movies.removeWhere((m) => m.server == s.name);
-                    });
-                    await _saveServers();
-                  }),
-            ),
-        ]);
-}
-
-class PlayerPage extends StatefulWidget {
-  final Movie movie;
-  final List<Movie> all;
-  const PlayerPage({super.key, required this.movie, required this.all});
-  @override
-  State<PlayerPage> createState() => _PlayerPageState();
-}
-
-class _PlayerPageState extends State<PlayerPage> {
-  late final Player player = Player();
-  late final VideoController controller = VideoController(player);
-  double volume = 100, bright = 0.5;
-  Timer? _timer;
-
-  @override
-  void initState() {
-    super.initState();
-    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
-    ScreenBrightness().current.then((v) => bright = v).catchError((_) => 0.5);
-    _start();
-  }
-
-  Future<void> _start() async {
-    final h = Store.i.find(widget.movie.url);
-    await player.open(Media(widget.movie.url));
-    if (h != null && h.resumable) {
-      await player.stream.duration.firstWhere((d) => d > Duration.zero);
-      await player.seek(Duration(milliseconds: h.pos));
-    }
-    _save();
-    _timer = Timer.periodic(const Duration(seconds: 10), (_) => _save());
-  }
-
-  void _save() {
-    final d = player.state.duration.inMilliseconds;
-    if (d > 0) Store.i.record(widget.movie, player.state.position.inMilliseconds, d);
-  }
-
-  @override
-  void dispose() {
-    _timer?.cancel();
-    _save();
-    try {
-      ScreenBrightness().resetScreenBrightness();
-    } catch (_) {}
-    player.dispose();
-    super.dispose();
-  }
-
-  String _lbl(dynamic t, int i) {
-    final p = <String>[];
-    if (t.title != null) p.add(t.title);
-    if (t.language != null) p.add(t.language);
-    return p.isEmpty ? 'Track ${i + 1}' : p.join(' • ');
-  }
-
-  Future<void> _switch(Movie m) async {
-    final pos = player.state.position;
-    Navigator.pop(context);
-    await player.open(Media(m.url));
-    await Future.delayed(const Duration(seconds: 1));
-    player.seek(pos);
-  }
-
-  void _settings() {
-    final versions = widget.movie.key.isEmpty
-        ? <Movie>[]
-        : widget.all.where((m) => m.key == widget.movie.key && m.url != widget.movie.url).toList();
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      showDragHandle: true,
-      builder: (_) => StatefulBuilder(builder: (ctx, set) {
-        final tr = player.state.tracks;
-        final audio = tr.audio.where((t) => t.id != 'auto' && t.id != 'no').toList();
-        final subs = tr.subtitle.where((t) => t.id != 'auto' && t.id != 'no').toList();
-        Widget head(String t) => Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-            child: Text(t, style: const TextStyle(fontWeight: FontWeight.bold)));
-        Widget slider(IconData ic, double v, double min, double max, void Function(double) f) => Row(children: [
-              Padding(padding: const EdgeInsets.only(left: 16), child: Icon(ic)),
-              Expanded(child: Slider(value: v.clamp(min, max), min: min, max: max, onChanged: (x) => set(() => f(x)))),
-            ]);
-        return ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: MediaQuery.of(ctx).size.height * 0.75),
-          child: SingleChildScrollView(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              head('Brightness'),
-              slider(Icons.brightness_6, bright, 0.02, 1, (v) {
-                bright = v;
-                ScreenBrightness().setScreenBrightness(v);
-              }),
-              head('Sound'),
-              slider(Icons.volume_up, volume, 0, 100, (v) {
-                volume = v;
-                player.setVolume(v);
-              }),
-              if (audio.length > 1) ...[
-                head('Language / Audio'),
-                for (var i = 0; i < audio.length; i++)
-                  ListTile(
-                    dense: true,
-                    title: Text(_lbl(audio[i], i)),
-                    trailing: player.state.track.audio.id == audio[i].id ? const Icon(Icons.check) : null,
-                    onTap: () {
-                      player.setAudioTrack(audio[i]);
-                      set(() {});
-                    },
-                  ),
-              ],
-              head('Subtitle'),
-              ListTile(
-                dense: true,
-                title: const Text('Off'),
-                trailing: player.state.track.subtitle.id == 'no' ? const Icon(Icons.check) : null,
-                onTap: () {
-                  player.setSubtitleTrack(SubtitleTrack.no());
-                  set(() {});
-                },
-              ),
-              for (var i = 0; i < subs.length; i++)
-                ListTile(
-                  dense: true,
-                  title: Text(_lbl(subs[i], i)),
-                  trailing: player.state.track.subtitle.id == subs[i].id ? const Icon(Icons.check) : null,
-                  onTap: () {
-                    player.setSubtitleTrack(subs[i]);
-                    set(() {});
-                  },
-                ),
-              head('Speed'),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: Wrap(spacing: 8, children: [
-                  for (final s in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
-                    ChoiceChip(
-                        label: Text('${s}x'),
-                        selected: player.state.rate == s,
-                        onSelected: (_) {
-                          player.setRate(s);
-                          set(() {});
-                        }),
-                ]),
-              ),
-              if (versions.isNotEmpty) ...[
-                head('Quality / Resolution'),
-                for (final m in versions)
-                  ListTile(
-                    dense: true,
-                    leading: const Icon(Icons.high_quality),
-                    title: Text(m.res.isEmpty ? m.name : '${m.res}  •  ${m.server}'),
-                    subtitle: Text(m.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-                    onTap: () => _switch(m),
-                  ),
-              ],
-              const SizedBox(height: 24),
-            ]),
-          ),
-        );
-      }),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final title = Expanded(
-        child: Text(widget.movie.clean,
-            maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white)));
-    final tune = MaterialCustomButton(icon: const Icon(Icons.tune), onPressed: _settings);
-    final back = MaterialCustomButton(icon: const Icon(Icons.arrow_back), onPressed: () => Navigator.pop(context));
-    // Swipe up/down: left side = brightness, right side = volume.
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: MaterialVideoControlsTheme(
-        normal: MaterialVideoControlsThemeData(
-            topButtonBar: [back, title, tune], brightnessGesture: true, volumeGesture: true),
-        fullscreen: MaterialVideoControlsThemeData(
-            topButtonBar: [title, tune], brightnessGesture: true, volumeGesture: true),
-        child: Video(controller: controller),
-      ),
-    );
-  }
-}
+              Positioned
