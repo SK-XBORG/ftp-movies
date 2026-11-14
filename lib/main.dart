@@ -107,7 +107,7 @@ class _HomePageState extends State<HomePage> {
       final name = e.name ?? '';
       if (name.isEmpty || name == '.' || name == '..') continue;
       final full = dir.endsWith('/') ? '$dir$name' : '$dir/$name';
-      if (e.type == FTPEntryType.DIR) {
+      if (e.type.toString().toLowerCase().endsWith('dir')) {
         await _crawl(ftp, s, full, depth + 1);
       } else if (videoExt.contains(name.split('.').last.toLowerCase())) {
         final url = Uri(
