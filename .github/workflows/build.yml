@@ -16,9 +16,10 @@ jobs:
           flutter create --platforms=android --project-name ftp_movies app
           cp pubspec.yaml app/pubspec.yaml
           rm -rf app/lib && cp -r lib app/lib
-          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' app/android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application android:usesCleartextTraffic="true"#' app/android/app/src/main/AndroidManifest.xml
           cd app && flutter pub get && flutter build apk --release --split-per-abi
       - uses: actions/upload-artifact@v4
         with:
           name: apk
           path: app/build/app/outputs/flutter-apk/*.apk
+          
